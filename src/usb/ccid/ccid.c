@@ -103,10 +103,6 @@ static usb_buffer_t *ccid_rx = NULL, *ccid_tx = NULL;
 int driver_process_usb_packet_ccid(uint8_t itf, uint16_t rx_read);
 void ccid_init(void);
 void ccid_task(void);
-#ifdef ENABLE_EMULATION
-void tud_vendor_rx_cb(uint8_t itf, const uint8_t *buffer, uint16_t bufsize);
-#endif
-
 static void ccid_write_offset(uint8_t itf, uint16_t size, uint16_t offset) {
     ccid_tx[itf].w_ptr += size + offset;
     ccid_tx[itf].r_ptr += offset;
@@ -174,6 +170,7 @@ static void ccid_init_buffers(void) {
     if (ccid_resp_fast == NULL) {
         ccid_resp_fast = (ccid_header_t **)calloc(ITF_SC_TOTAL, sizeof(ccid_header_t *));
     }
+    if (!ccid_rx || !ccid_tx || !ccid_header || !ccid_response || !ccid_resp_fast) abort();
 }
 
 static int driver_init_ccid(uint8_t itf) {
@@ -190,26 +187,25 @@ static int driver_init_ccid(uint8_t itf) {
     return PICOKEYS_OK;
 }
 
-void tud_vendor_rx_cb(uint8_t itf, const uint8_t *buffer, uint16_t bufsize) {
-    (void)buffer;
-    (void)bufsize;
-    uint32_t len = tud_vendor_n_available(itf);
-    do {
-        uint16_t remaining = (uint16_t)(sizeof(ccid_rx[itf].buffer) - ccid_rx[itf].w_ptr);
-        if (remaining == 0) {
-            ccid_rx[itf].r_ptr = ccid_rx[itf].w_ptr = 0;
-            remaining = sizeof(ccid_rx[itf].buffer);
-        }
-        uint16_t tlen = len > remaining ? remaining : (uint16_t)len;
-        tlen = (uint16_t)tud_vendor_n_read(itf, ccid_rx[itf].buffer + ccid_rx[itf].w_ptr, tlen);
-        ccid_rx[itf].w_ptr += tlen;
-        driver_process_usb_packet_ccid(itf, tlen);
-        if (ccid_rx[itf].w_ptr == sizeof(ccid_rx[itf].buffer) && ccid_rx[itf].r_ptr == 0) {
-            ccid_rx[itf].r_ptr = ccid_rx[itf].w_ptr = 0;
-        }
-        len -= tlen;
-    } while (len > 0);
+#ifndef ENABLE_EMULATION
+static void ccid_read(uint8_t itf) {
+    usb_buffer_t *rx = &ccid_rx[itf];
+    uint32_t available = tud_vendor_n_available(itf);
+    if (available == 0 && rx->r_ptr == rx->w_ptr) return;
+    if (available && rx->r_ptr) {
+        memmove(rx->buffer, rx->buffer + rx->r_ptr, rx->w_ptr - rx->r_ptr);
+        rx->w_ptr -= rx->r_ptr;
+        rx->r_ptr = 0;
+    }
+    uint16_t room = (uint16_t)(sizeof(rx->buffer) - rx->w_ptr);
+    uint16_t count = (uint16_t)MIN(available, room);
+    if (count) {
+        count = (uint16_t)tud_vendor_n_read(itf, rx->buffer + rx->w_ptr, count);
+        rx->w_ptr += count;
+    }
+    driver_process_usb_packet_ccid(itf, count);
 }
+#endif
 
 static int driver_write_ccid(uint8_t itf, const_byte_array_t buffer) {
     if (buffer.len > UINT16_MAX) {
@@ -278,6 +274,9 @@ int driver_process_usb_packet_ccid(uint8_t itf, uint16_t rx_read) {
                 ccid_write_fast(itf, CONST_BYTE_ARRAY((const uint8_t *)ccid_resp_fast[itf], 10));
             }
             else if (ccid_header[itf]->bMessageType == CCID_POWER_ON) {
+                // IccPowerOn also performs a warm card reset. Authentication
+                // must not survive merely because no PowerOff preceded it.
+                card_reset_app(sc_itf_to_usb_itf(itf));
                 size_t size_atr = (ccid_atr ? ccid_atr[0] : 0);
                 ccid_resp_fast[itf]->bMessageType = CCID_DATA_BLOCK_RET;
                 ccid_resp_fast[itf]->dwLength = (uint32_t)size_atr;
@@ -297,7 +296,7 @@ int driver_process_usb_packet_ccid(uint8_t itf, uint16_t rx_read) {
             }
             else if (ccid_header[itf]->bMessageType == CCID_POWER_OFF) {
                 if (ccid_status == 0) {
-                    //card_exit(0);
+                    card_reset_app(sc_itf_to_usb_itf(itf));
                 }
                 ccid_status = 1;
                 ccid_resp_fast[itf]->bMessageType = CCID_SLOT_STATUS_RET;
@@ -343,11 +342,13 @@ int driver_process_usb_packet_ccid(uint8_t itf, uint16_t rx_read) {
                 ccid_write_fast(itf, CONST_BYTE_ARRAY((const uint8_t *)ccid_resp_fast[itf], 18));
             }
             else if (ccid_header[itf]->bMessageType == CCID_XFR_BLOCK) {
+                uint8_t usb_itf = sc_itf_to_usb_itf(itf);
+                apdu_select_transport(usb_itf);
                 apdu.rdata = &ccid_response[itf]->apdu;
-                apdu_sent = apdu_process(itf, CONST_BYTE_ARRAY(&ccid_header[itf]->apdu, (uint16_t)ccid_header[itf]->dwLength));
+                apdu_sent = apdu_process(usb_itf, CONST_BYTE_ARRAY(&ccid_header[itf]->apdu, (uint16_t)ccid_header[itf]->dwLength));
 #ifndef ENABLE_EMULATION
                 if (apdu_sent > 0) {
-                    card_start(sc_itf_to_usb_itf(itf), apdu_thread);
+                    card_start(usb_itf, apdu_thread);
                     usb_send_event(EV_CMD_AVAILABLE);
                 }
 #endif
@@ -404,6 +405,13 @@ void ccid_task(void) {
     }
 #endif
     for (uint8_t itf = 0; itf < ITF_SC_TOTAL; itf++) {
+#ifndef ENABLE_EMULATION
+        // Keep both APDU transports on the USB application loop. Starting
+        // CCID from the TinyUSB callback can block reception of FIDO CANCEL.
+        // Retain response backing until TinyUSB has accepted every byte.
+        // A pipelined command must not append a second response past it.
+        if (!is_busy() && ccid_tx[itf].w_ptr == ccid_tx[itf].r_ptr) ccid_read(itf);
+#endif
         if (itf < (sizeof(last_status_poll_ms) / sizeof(last_status_poll_ms[0])) &&
             now_ms - last_status_poll_ms[itf] >= status_poll_interval_ms) {
             last_status_poll_ms[itf] = now_ms;
@@ -421,6 +429,14 @@ void ccid_task(void) {
             }
         }
     }
+}
+
+void ccid_session_reset(void) {
+    for (uint8_t i = 0; i < ITF_SC_TOTAL; ++i) {
+        memset(&ccid_rx[i], 0, sizeof(*ccid_rx));
+        memset(&ccid_tx[i], 0, sizeof(*ccid_tx));
+    }
+    ccid_status = CCID_STATUS_PRESENT;
 }
 
 void ccid_init(void) {
@@ -443,22 +459,25 @@ static void ccid_reset_cb(uint8_t rhport) {
     wcid_event_len = 0;
     wcid_event_pending = false;
     vendord_reset(rhport);
+    usb_session_reset_request();
 }
 
 static uint16_t ccid_open(uint8_t rhport, tusb_desc_interface_t const *itf_desc, uint16_t max_len) {
-    uint8_t *itf_vendor = (uint8_t *) malloc(sizeof(uint8_t) * max_len);
+    TU_VERIFY(itf_desc && max_len >= sizeof(*itf_desc), 0);
     TU_VERIFY( itf_desc->bInterfaceClass == TUSB_CLASS_SMART_CARD && itf_desc->bInterfaceSubClass == 0 && itf_desc->bInterfaceProtocol == 0, 0);
 
     //vendord_open expects a CLASS_VENDOR interface class
     uint16_t const drv_len = sizeof(tusb_desc_interface_t) + sizeof(struct ccid_class_descriptor) + TUSB_SMARTCARD_CCID_EPS * sizeof(tusb_desc_endpoint_t);
-    memcpy(itf_vendor, itf_desc, sizeof(uint8_t) * max_len);
+    TU_VERIFY(max_len >= drv_len, 0);
+    uint8_t itf_vendor[sizeof(tusb_desc_interface_t) + sizeof(struct ccid_class_descriptor) + TUSB_SMARTCARD_CCID_EPS * sizeof(tusb_desc_endpoint_t)];
+    memcpy(itf_vendor, itf_desc, drv_len);
     ((tusb_desc_interface_t *) itf_vendor)->bInterfaceClass = TUSB_CLASS_VENDOR_SPECIFIC;
 #if TUSB_SMARTCARD_CCID_EPS == 3
     ((tusb_desc_interface_t *) itf_vendor)->bNumEndpoints -= 1;
-    vendord_open(rhport, (tusb_desc_interface_t *)itf_vendor, max_len - sizeof(tusb_desc_endpoint_t));
+    TU_VERIFY(vendord_open(rhport, (tusb_desc_interface_t *)itf_vendor, drv_len - sizeof(tusb_desc_endpoint_t)), 0);
     tusb_desc_endpoint_t const *desc_ep = (tusb_desc_endpoint_t const *)((uint8_t *)itf_desc + drv_len - sizeof(tusb_desc_endpoint_t));
     TU_ASSERT(usbd_edpt_open(rhport, desc_ep), 0);
-    uint8_t msg[] = { 0x50, 0x03 };
+    static uint8_t msg[] = { 0x50, 0x03 };
 #if defined(PICO_PLATFORM)
     usbd_edpt_xfer(rhport, desc_ep->bEndpointAddress, msg, sizeof(msg));
 #elif defined(ESP_PLATFORM)
@@ -467,11 +486,8 @@ static uint16_t ccid_open(uint8_t rhport, tusb_desc_interface_t const *itf_desc,
     usbd_edpt_xfer(rhport, desc_ep->bEndpointAddress, msg, sizeof(msg), sizeof(msg));
 #endif
 #else
-    vendord_open(rhport, (tusb_desc_interface_t *)itf_vendor, max_len);
+    TU_VERIFY(vendord_open(rhport, (tusb_desc_interface_t *)itf_vendor, drv_len), 0);
 #endif
-    free(itf_vendor);
-
-    TU_VERIFY(max_len >= drv_len, 0);
 
     itf_num = itf_desc->bInterfaceNumber;
     return drv_len;
@@ -481,6 +497,7 @@ static uint16_t ccid_open(uint8_t rhport, tusb_desc_interface_t const *itf_desc,
 static bool ccid_control_xfer_cb(uint8_t __unused rhport,
                                  uint8_t stage,
                                  tusb_control_request_t const *request) {
+    if (usb_session_reset_pending()) return false;
     // nothing to do with DATA & ACK stage
     TU_LOG2("-------- CCID CTRL XFER\n");
     if (stage != CONTROL_STAGE_SETUP) {

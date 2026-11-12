@@ -26,6 +26,11 @@
 
 led_driver_t *led_driver = NULL;
 
+WEAK bool led_render_board_status(uint32_t now) {
+    (void)now;
+    return false;
+}
+
 static uint32_t led_mode = MODE_NOT_MOUNTED;
 
 static volatile bool blink_pending = false;
@@ -100,6 +105,10 @@ void led_blinking_task(void) {
             return;
         }
     }
+    if ((led_driver->render_status && led_driver->render_status(now)) ||
+        led_render_board_status(now)) {
+        return;
+    }
     uint8_t state = led_state;
 #ifdef PICO_DEFAULT_LED_PIN_INVERTED
     state = !state;
@@ -146,6 +155,9 @@ extern led_driver_t led_driver_pico;
 extern led_driver_t led_driver_cyw43;
 extern led_driver_t led_driver_ws2812;
 extern led_driver_t led_driver_neopixel;
+#ifdef ESP_PLATFORM
+extern led_driver_t led_driver_apa102;
+#endif
 extern led_driver_t led_driver_pimoroni;
 
 static void led_driver_init_dummy(void) {
@@ -168,7 +180,11 @@ void led_init(void) {
     led_driver = &led_driver_dummy;
 #if defined(PICO_PLATFORM) || defined(ESP_PLATFORM)
     // Guess default driver
-#if defined(PIMORONI_TINY2040) || defined(PIMORONI_TINY2350)
+#if defined(ESP_PLATFORM) && defined(PICO_BOARD_TDONGLE_S3)
+    led_driver = &led_driver_apa102;
+    phy_data.led_driver = phy_data.led_driver_present ? phy_data.led_driver : PHY_LED_DRIVER_APA102;
+    phy_data.led_gpio = phy_data.led_gpio_present ? phy_data.led_gpio : GPIO_NUM_40;
+#elif defined(PIMORONI_TINY2040) || defined(PIMORONI_TINY2350)
     led_driver = &led_driver_pimoroni;
     phy_data.led_driver = phy_data.led_driver_present ? phy_data.led_driver : PHY_LED_DRIVER_PIMORONI;
     phy_data.led_gpio = phy_data.led_gpio_present ? phy_data.led_gpio : PICO_DEFAULT_LED_PIN;
@@ -204,6 +220,9 @@ void led_init(void) {
                 led_driver = &led_driver_pico;
                 break;
 #ifdef ESP_PLATFORM
+            case PHY_LED_DRIVER_APA102:
+                led_driver = &led_driver_apa102;
+                break;
             case PHY_LED_DRIVER_NEOPIXEL:
                 led_driver = &led_driver_neopixel;
                 break;

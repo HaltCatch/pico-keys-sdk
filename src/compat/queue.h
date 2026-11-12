@@ -26,13 +26,17 @@
 #include <semaphore.h>
 #endif
 #include <stdbool.h>
+#include <assert.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
 typedef struct {
     pthread_mutex_t mtx;
     pthread_cond_t  cnd;
     size_t        size_elem;
     size_t num_elem;
     size_t max_elem;
-    uint8_t buf[1024];
+    uint8_t *buf;
     bool is_init;
 #ifdef _MSC_VER
     char padding[sizeof(void *) - sizeof(bool)];
@@ -42,12 +46,17 @@ typedef struct {
 static inline void queue_free(queue_t *a) {
     pthread_mutex_destroy(&a->mtx);
     pthread_cond_destroy(&a->cnd);
+    free(a->buf);
+    a->buf = NULL;
     a->is_init = false;
 }
 static inline void queue_init(queue_t *a, size_t size_elem, size_t max_elem) {
+    if (size_elem == 0 || max_elem == 0 || max_elem > SIZE_MAX / size_elem) abort();
     if (a->is_init) {
         queue_free(a);
     }
+    a->buf = malloc(size_elem * max_elem);
+    if (!a->buf) abort();
     pthread_mutex_init(&a->mtx, NULL);
     pthread_cond_init(&a->cnd, NULL);
     a->size_elem = size_elem;
@@ -100,6 +109,13 @@ static inline int queue_try_remove(queue_t *a, void *b) {
     pthread_cond_signal(&a->cnd);
     pthread_mutex_unlock(&a->mtx);
     return 1;
+}
+static inline int queue_try_peek(queue_t *a, void *b) {
+    pthread_mutex_lock(&a->mtx);
+    bool available = a->num_elem != 0;
+    if (available) memcpy(b, a->buf, a->size_elem);
+    pthread_mutex_unlock(&a->mtx);
+    return available;
 }
 static inline int queue_is_empty(queue_t *a) {
     pthread_mutex_lock(&a->mtx);

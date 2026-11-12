@@ -36,6 +36,10 @@
 #define OTP_KEY_1    OTP_MKEK_ROW
 #define OTP_KEY_2    OTP_DEVK_ROW
 
+#ifndef PICOKEYS_RP2350_OTP_WRITES
+#define PICOKEYS_RP2350_OTP_WRITES 0
+#endif
+
 
 static bool is_empty_buffer(const_byte_array_t buffer) {
     for (size_t i = 0; i < buffer.len; i++) {
@@ -46,6 +50,7 @@ static bool is_empty_buffer(const_byte_array_t buffer) {
     return true;
 }
 
+#if PICOKEYS_RP2350_OTP_WRITES
 static int otp_write_data_mode(uint16_t row, const_byte_array_t data, bool is_ecc) {
     if (data.len > UINT16_MAX) {
         return BOOTROM_ERROR_INVALID_STATE;
@@ -65,6 +70,7 @@ static int otp_write_data(uint16_t row, const_byte_array_t data) {
 static int otp_write_data_raw(uint16_t row, const_byte_array_t data) {
     return otp_write_data_mode(row, data, false);
 }
+#endif
 
 static const uint8_t* otp_buffer(uint16_t row) {
     volatile uint32_t *p = ((uint32_t *)(OTP_DATA_BASE + (row*2)));
@@ -80,6 +86,7 @@ static bool is_empty_otp_buffer(uint16_t row, uint16_t len) {
     return is_empty_buffer(CONST_BYTE_ARRAY(otp_buffer_raw(row), len * 2));
 }
 
+#if PICOKEYS_RP2350_OTP_WRITES
 static bool is_otp_locked_page(uint8_t page) {
 	volatile uint32_t *p = ((uint32_t *)(OTP_DATA_BASE + ((OTP_DATA_PAGE0_LOCK0_ROW + page*2)*2)));
     return ((p[0] & 0xFFFF0000) == 0x3C3C0000 && (p[1] & 0xFF) == 0x3C);
@@ -146,6 +153,7 @@ static void otp_migrate_chaff(void) {
     otp_migrate_key(OTP_DEVK_ROW, OTP_OLD_DEVK_ROW, 32);
     otp_lock_page(OTP_MKEK_ROW >> 6);
 }
+#endif
 
 bool otp_platform_is_secure_boot_enabled(uint8_t *bootkey) {
     const uint8_t *crit1 = otp_buffer(OTP_DATA_CRIT1_ROW);
@@ -198,6 +206,11 @@ bool otp_platform_is_secure_boot_locked(void) {
 }
 
 int otp_platform_enable_secure_boot(uint8_t bootkey, bool secure_lock) {
+#if !PICOKEYS_RP2350_OTP_WRITES
+    (void)bootkey;
+    (void)secure_lock;
+    return PICOKEYS_EXEC_ERROR;
+#else
     int ret = 0;
 
     if (bootkey >= 6) {
@@ -252,9 +265,35 @@ err:
         return ret;
     }
     return PICOKEYS_OK;
+#endif
 }
 
 void otp_platform_init(const uint8_t **otp_key_1_out, const uint8_t **otp_key_2_out) {
+#if !PICOKEYS_RP2350_OTP_WRITES
+    // Read old keys in place: do not migrate, invalidate, add chaff or lock pages.
+    // Never substitute the public serial-number fallback for a missing root.
+    uint16_t root_row = !is_empty_otp_buffer(OTP_MKEK_ROW, 32) ? OTP_MKEK_ROW : OTP_OLD_MKEK_ROW;
+    *otp_key_1_out = NULL;
+    *otp_key_2_out = NULL;
+    if (is_empty_otp_buffer(root_row, 32)) {
+        panic("OTP root absent; writes disabled. No credentials were initialized.");
+    }
+    bool all_zero = true, all_ff = true;
+    for (size_t i = 0; i < 32; ++i) {
+        all_zero &= otp_buffer(root_row)[i] == 0;
+        all_ff &= otp_buffer(root_row)[i] == 0xff;
+    }
+    if (all_zero || all_ff) {
+        panic("OTP root unreadable or invalid; refusing a replacement root.");
+    }
+    *otp_key_1_out = otp_buffer(root_row);
+    if (!is_empty_otp_buffer(OTP_DEVK_ROW, 32)) {
+        *otp_key_2_out = otp_buffer(OTP_DEVK_ROW);
+    } else if (!is_empty_otp_buffer(OTP_OLD_DEVK_ROW, 32)) {
+        *otp_key_2_out = otp_buffer(OTP_OLD_DEVK_ROW);
+    }
+    // A missing attestation key uses the existing encrypted-flash key path.
+#else
     otp_migrate_chaff();
 
     int ret = 0;
@@ -298,4 +337,5 @@ void otp_platform_init(const uint8_t **otp_key_1_out, const uint8_t **otp_key_2_
             otp_lock_page(write_otp[i] >> 6);
         }
     }
+#endif
 }

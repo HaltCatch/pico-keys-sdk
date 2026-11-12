@@ -59,13 +59,13 @@
 #define PHY_LED_DRIVER_PICO     0x1
 #define PHY_LED_DRIVER_PIMORONI 0x2
 #define PHY_LED_DRIVER_WS2812   0x3
-#ifdef CYW43_WL_GPIO_LED_PIN
+/* Persistent driver IDs must not depend on board-header include order. */
 #define PHY_LED_DRIVER_CYW43    0x4
-#endif
 #ifdef ESP_PLATFORM
 #define PHY_LED_DRIVER_NEOPIXEL  0x5
 #endif
 
+#define PHY_LED_DRIVER_APA102 0x6
 #define PHY_LED_DRIVER_NONE     0xFF
 
 #define PHY_LED_ORDER_RGB 0x0
@@ -115,13 +115,11 @@ typedef struct phy_data {
 
 #define PHY_MAX_SIZE    ((2+4)+(2+4)+(2+32)+(2+2)+(2+1)+(2+1)+(2+1)+(2+1)+(2+2))
 
-#ifndef ENABLE_EMULATION
 extern int phy_serialize_data(const phy_data_t *phy, byte_buffer_t *data);
 extern int phy_unserialize_data(const_byte_array_t data, phy_data_t *phy);
 extern int phy_init(void);
 extern int phy_save(void);
 extern int phy_load(void);
 extern phy_data_t phy_data;
-#endif
 
 #endif // _PHY_H_

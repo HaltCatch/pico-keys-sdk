@@ -19,6 +19,7 @@
 #define _LED_H_
 
 #include <stdint.h>
+#include <stdbool.h>
 
 enum {
     LED_COLOR_OFF = 0,
@@ -65,12 +66,16 @@ extern void led_set_mode(uint32_t mode);
 extern uint32_t led_get_mode(void);
 extern void led_blink_n_times(uint8_t count, uint8_t color, uint32_t on_ms, uint32_t off_ms);
 extern void led_blinking_task(void);
+/* Optional board renderer, called from the LED task after explicit blinks. */
+extern bool led_render_board_status(uint32_t now);
 extern void led_off_all(void);
 extern void led_init(void);
 
 typedef struct {
     void (*init)(void);
     void (*set_color)(uint8_t color, uint32_t led_brightness, float progress);
+    /* Optional status renderer for drivers that cannot express RGB states. */
+    bool (*render_status)(uint32_t now);
 } led_driver_t;
 
 extern led_driver_t *led_driver;

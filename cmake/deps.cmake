@@ -15,13 +15,11 @@ set(MLKEM_PATH "${CMAKE_CURRENT_LIST_DIR}/../third-party/mlkem")
 set(MLDSA_PATH "${CMAKE_CURRENT_LIST_DIR}/../third-party/mldsa")
 set(LIBCVC_PATH "${CMAKE_CURRENT_LIST_DIR}/../third-party/libcvc")
 
-set(PICOKEYS_MBEDTLS_STD_REPO "https://github.com/Mbed-TLS/mbedtls.git")
-set(PICOKEYS_MBEDTLS_STD_REF "v3.6.7")
 set(PICOKEYS_MBEDTLS_EDDSA_REPO "https://github.com/polhenarejos/mbedtls.git")
 set(PICOKEYS_MBEDTLS_EDDSA_REF "v3.6.7-eddsa")
 
 set(PICOKEYS_TINYCBOR_REPO "https://github.com/intel/tinycbor.git")
-set(PICOKEYS_TINYCBOR_REF "v0.6.1")
+set(PICOKEYS_TINYCBOR_REF "v7.1")
 set(PICOKEYS_CJSON_REPO "https://github.com/DaveGamble/cJSON.git")
 set(PICOKEYS_CJSON_REF "v1.7.19")
 set(PICOKEYS_MLKEM_REPO "https://github.com/pq-code-package/mlkem-native.git")
@@ -31,88 +29,43 @@ set(PICOKEYS_MLDSA_REF "v1.0.0-beta2")
 set(PICOKEYS_LIBCVC_REPO "https://github.com/polhenarejos/libcvc.git")
 set(PICOKEYS_LIBCVC_REF "main")
 
-set(PICOKEYS_FETCH_DEPS_ON_DEMAND ON CACHE BOOL "Fetch third-party deps into pico-keys-sdk/third-party when missing")
-
+option(PICOKEYS_FETCH_DEPS_ON_DEMAND "Fetch missing optional dependencies" ON)
 function(picokeys_sync_dep name repo ref dest)
-    set(_marker "${dest}/.picokeys_dep_source")
-    set(_need_fetch OFF)
-
-    if(NOT EXISTS "${dest}")
-        if(NOT PICOKEYS_FETCH_DEPS_ON_DEMAND)
-            message(FATAL_ERROR "${name} source code not found at ${dest}. Enable PICOKEYS_FETCH_DEPS_ON_DEMAND or provide the source tree manually.")
-        endif()
-        set(_need_fetch ON)
-    else()
-        set(_repo_ok OFF)
-        set(_ref_ok OFF)
-        if(EXISTS "${_marker}")
-            file(STRINGS "${_marker}" _meta_lines)
-            foreach(_line IN LISTS _meta_lines)
-                if(_line STREQUAL "REPO=${repo}")
-                    set(_repo_ok ON)
-                endif()
-                if(_line STREQUAL "REF=${ref}")
-                    set(_ref_ok ON)
-                endif()
-            endforeach()
-        endif()
-        if(NOT _repo_ok OR NOT _ref_ok)
-            set(_need_fetch ON)
+    set(marker CMakeLists.txt)
+    if(name STREQUAL "mlkem_dep")
+        set(marker mlkem/src/kem.c)
+    elseif(name STREQUAL "mldsa_dep")
+        set(marker mldsa/src/sign.c)
+    endif()
+    if(NOT EXISTS "${dest}/${marker}")
+        if(name MATCHES "^(cjson|mlkem|mldsa)_dep$" AND PICOKEYS_FETCH_DEPS_ON_DEMAND)
+            FetchContent_Populate(${name}
+                GIT_REPOSITORY "${repo}" GIT_TAG "${ref}" GIT_SHALLOW TRUE
+                UPDATE_DISCONNECTED TRUE SOURCE_DIR "${dest}"
+                BINARY_DIR "${CMAKE_BINARY_DIR}/_deps/${name}-build"
+                SUBBUILD_DIR "${CMAKE_BINARY_DIR}/_deps/${name}-subbuild")
+        else()
+            message(FATAL_ERROR "Missing dependency ${name} at ${dest}: initialize SDK submodules; optional dependencies require PICOKEYS_FETCH_DEPS_ON_DEMAND=ON or pre-populated sources")
         endif()
     endif()
-
-    if(_need_fetch)
-        message(STATUS "[deps] ${name}: repo=${repo} ref=${ref} status=updating (this may take a few seconds)")
-        if(EXISTS "${dest}")
-            file(REMOVE_RECURSE "${dest}")
-        endif()
-        execute_process(
-            COMMAND git clone ${repo} ${dest}
-            RESULT_VARIABLE _clone_rc
-            OUTPUT_VARIABLE _clone_out
-            ERROR_VARIABLE _clone_err
-            OUTPUT_STRIP_TRAILING_WHITESPACE
-            ERROR_STRIP_TRAILING_WHITESPACE
-        )
-        if(NOT _clone_rc EQUAL 0)
-            message(FATAL_ERROR "Failed to clone ${name} from ${repo}\nstdout: ${_clone_out}\nstderr: ${_clone_err}")
-        endif()
-        execute_process(
-            COMMAND git -C ${dest} checkout ${ref}
-            RESULT_VARIABLE _checkout_rc
-            OUTPUT_VARIABLE _checkout_out
-            ERROR_VARIABLE _checkout_err
-            OUTPUT_STRIP_TRAILING_WHITESPACE
-            ERROR_STRIP_TRAILING_WHITESPACE
-        )
-        if(NOT _checkout_rc EQUAL 0)
-            message(FATAL_ERROR "Failed to checkout ${name} ref ${ref}\nstdout: ${_checkout_out}\nstderr: ${_checkout_err}")
-        endif()
-        if(NOT EXISTS "${dest}")
-            message(FATAL_ERROR "Failed to fetch ${name} into ${dest}")
-        endif()
-        file(WRITE "${_marker}" "REPO=${repo}\nREF=${ref}\n")
-    else()
-        message(STATUS "[deps] ${name}: repo=${repo} ref=${ref} status=cached")
-    endif()
+    message(STATUS "[deps] ${name}: pinned source at ${dest}")
 endfunction()
 
+picokeys_sync_dep(mbedtls_dep "${PICOKEYS_MBEDTLS_EDDSA_REPO}" "${PICOKEYS_MBEDTLS_EDDSA_REF}" "${MBEDTLS_PATH}")
 if(ENABLE_EDDSA)
-    set(MBEDTLS_ORIGIN "${PICOKEYS_MBEDTLS_EDDSA_REPO}")
-    set(MBEDTLS_REF "${PICOKEYS_MBEDTLS_EDDSA_REF}")
-
+    if(NOT EXISTS "${MBEDTLS_PATH}/library/eddsa.c")
+        message(FATAL_ERROR "EdDSA requires the pinned Pico Keys Mbed TLS source. Run tools/checkout-deps.sh.")
+    endif()
     add_compile_definitions(
         MBEDTLS_ECP_DP_ED25519_ENABLED=1
         MBEDTLS_ECP_DP_ED448_ENABLED=1
         MBEDTLS_EDDSA_C=1
         MBEDTLS_SHA3_C=1
     )
-else()
-    set(MBEDTLS_ORIGIN "${PICOKEYS_MBEDTLS_STD_REPO}")
-    set(MBEDTLS_REF "${PICOKEYS_MBEDTLS_STD_REF}")
+elseif(EXISTS "${MBEDTLS_PATH}/library/eddsa.c")
+    # This Mbed TLS release references its Edwards helper even without EdDSA.
+    add_compile_definitions(MBEDTLS_ECP_DP_ED25519_ENABLED=1)
 endif()
-
-picokeys_sync_dep(mbedtls_dep "${MBEDTLS_ORIGIN}" "${MBEDTLS_REF}" "${MBEDTLS_PATH}")
 
 if(USB_ITF_HID)
     picokeys_sync_dep(tinycbor_dep "${PICOKEYS_TINYCBOR_REPO}" "${PICOKEYS_TINYCBOR_REF}" "${TINYCBOR_PATH}")

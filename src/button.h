@@ -20,6 +20,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 
 #if defined(ESP_PLATFORM)
 #define BOOT_PIN GPIO_NUM_0
@@ -36,7 +37,7 @@ extern void button_wait_start(void);
 extern void button_wait_poll(void);
 extern volatile uint32_t button_pressed_duration;
 extern void button_task(void);
-extern volatile bool cancel_button;
+extern atomic_bool cancel_button;
 extern bool touch_accept_button;
 extern volatile bool force_button_wait;
 extern uint32_t button_timeout_seconds(void);

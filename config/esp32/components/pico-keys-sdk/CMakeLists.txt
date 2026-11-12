@@ -11,6 +11,12 @@ set(PICOKEYS_INCLUDE_DIRS
 )
 
 set(PICOKEYS_REQUIRES
+    nvs_flash
+    fatfs
+    sdmmc
+    esp_driver_sdspi
+    esp_driver_i2s
+    esp_ringbuf
     bootloader_support
     app_update
     esp_partition

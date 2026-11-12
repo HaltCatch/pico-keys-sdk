@@ -17,6 +17,7 @@
 
 #include "picokeys.h"
 #include "apdu.h"
+#include "mbedtls/platform_util.h"
 #include "led/led.h"
 #include "usb.h"
 #include <stdio.h>
@@ -38,7 +39,79 @@ static uint8_t chain_header[4];
 
 struct apdu apdu;
 
+/* APDU continuations and chained commands belong to a transport, even though
+ * their execution is serialized by the single card worker. */
+typedef struct {
+    struct apdu command;
+    uint8_t *response;
+    uint16_t response_backup;
+    bool pending, chaining;
+    size_t chain_size;
+    uint8_t chain[sizeof(chain_buf)];
+    uint8_t header[sizeof(chain_header)];
+} apdu_transport_t;
+static apdu_transport_t *transport_state;
+static uint8_t active_transport = ITF_INVALID;
+
+void apdu_transport_init(void) {
+    transport_state = calloc(ITF_TOTAL, sizeof(*transport_state));
+    if (!transport_state) abort();
+}
+
+void apdu_select_transport(uint8_t itf) {
+    if (itf == active_transport || itf >= ITF_TOTAL) return;
+    if (active_transport < ITF_TOTAL) {
+        apdu_transport_t *old = &transport_state[active_transport];
+        old->command = apdu;
+        old->response = rdata_gr;
+        old->response_backup = rdata_bk;
+        old->pending = response_pending;
+        old->chaining = is_chaining;
+        old->chain_size = chain_ptr ? (size_t)(chain_ptr - chain_buf) : 0;
+        mbedtls_platform_zeroize(old->chain, sizeof(old->chain));
+        if (is_chaining) {
+            memcpy(old->chain, chain_buf, sizeof(chain_buf));
+            memcpy(old->header, chain_header, sizeof(chain_header));
+        }
+    }
+    apdu_transport_t *next = &transport_state[itf];
+    apdu = next->command;
+    rdata_gr = next->response;
+    rdata_bk = next->response_backup;
+    response_pending = next->pending;
+    is_chaining = next->chaining;
+    mbedtls_platform_zeroize(chain_buf, sizeof(chain_buf));
+    chain_ptr = NULL;
+    if (is_chaining) {
+        memcpy(chain_buf, next->chain, sizeof(chain_buf));
+        memcpy(chain_header, next->header, sizeof(chain_header));
+        chain_ptr = chain_buf + next->chain_size;
+    }
+    mbedtls_platform_zeroize(next->chain, sizeof(next->chain));
+    active_transport = itf;
+}
+
+bool apdu_transport_can_yield(uint8_t itf) {
+    if (itf >= ITF_TOTAL) return true;
+    if (itf == active_transport) return !response_pending && !is_chaining;
+    return !transport_state[itf].pending && !transport_state[itf].chaining;
+}
+
+void apdu_reset_transport(uint8_t itf) {
+    if (itf >= ITF_TOTAL) return;
+    mbedtls_platform_zeroize(&transport_state[itf], sizeof(*transport_state));
+    if (active_transport == itf) {
+        response_pending = is_chaining = false;
+        rdata_gr = chain_ptr = NULL;
+        rdata_bk = apdu.rlen = apdu.sw = 0;
+        mbedtls_platform_zeroize(chain_buf, sizeof(chain_buf));
+    }
+}
+
+WEAK void gui_set_smartcard_status(const char *status) { (void)status; }
+
 int process_apdu(void) {
+    gui_set_smartcard_status("CCID Active");
     bool is_select = INS(apdu) == 0xA4 && P1(apdu) == 0x04 && (P2(apdu) == 0x00 || P2(apdu) == 0x04);
     led_set_mode(MODE_PROCESSING);
     if (CLA(apdu) & 0x10) {
@@ -110,6 +183,20 @@ int process_apdu(void) {
     return SW_FILE_NOT_FOUND();
 }
 
+static void finish_continuation(uint8_t itf, uint16_t size, uint16_t offset) {
+#ifdef ENABLE_EMULATION
+    driver_exec_finished_cont_emul(itf, size, offset);
+#else
+#ifdef USB_ITF_HID
+    if (itf == ITF_HID) driver_exec_finished_cont_hid(ITF_HID_CTAP, size, offset);
+#endif
+#ifdef USB_ITF_CCID
+    if (itf == ITF_CCID) driver_exec_finished_cont_ccid(ITF_SC_CCID, size, offset);
+    if (itf == ITF_WCID) driver_exec_finished_cont_ccid(ITF_SC_WCID, size, offset);
+#endif
+#endif
+}
+
 uint16_t apdu_process(uint8_t itf, const_byte_array_t buffer) {
     uint32_t expected_size;
     uint16_t buffer_size = 0;
@@ -117,6 +204,14 @@ uint16_t apdu_process(uint8_t itf, const_byte_array_t buffer) {
     if (buffer.len < 4 || buffer.len > UINT16_MAX || buffer.data == NULL) {
         return 0;
     }
+#ifdef USB_ITF_CCID
+    if ((itf == ITF_CCID || itf == ITF_WCID) && !card_claim_apdu_context(itf)) {
+        apdu.rdata[0] = 0x69;
+        apdu.rdata[1] = 0x85;
+        finish_continuation(itf, 2, 0);
+        return 0;
+    }
+#endif
     buffer_size = (uint16_t)buffer.len;
     apdu.header = (uint8_t *)buffer.data;
     apdu.nc = apdu.ne = 0;
@@ -182,20 +277,7 @@ uint16_t apdu_process(uint8_t itf, const_byte_array_t buffer) {
         rdata_gr[0] = rdata_bk >> 8;
         rdata_gr[1] = rdata_bk & 0xff;
         if (apdu.rlen <= apdu.ne) {
-#ifndef ENABLE_EMULATION
-#ifdef USB_ITF_HID
-            if (itf == ITF_HID_CTAP) {
-                driver_exec_finished_cont_hid(itf, apdu.rlen + 2, (uint16_t)(rdata_gr - apdu.rdata));
-            }
-#endif
-#ifdef USB_ITF_CCID
-            if (itf == ITF_SC_CCID || itf == ITF_SC_WCID) {
-                driver_exec_finished_cont_ccid(itf, apdu.rlen + 2, (uint16_t)(rdata_gr - apdu.rdata));
-            }
-#endif
-#else
-            driver_exec_finished_cont_emul(itf, apdu.rlen + 2, (uint16_t)(rdata_gr - apdu.rdata));
-#endif
+            finish_continuation(itf, apdu.rlen + 2, (uint16_t)(rdata_gr - apdu.rdata));
             //Prepare next RAPDU
             apdu.sw = 0;
             apdu.rlen = 0;
@@ -212,20 +294,8 @@ uint16_t apdu_process(uint8_t itf, const_byte_array_t buffer) {
             else {
                 rdata_gr[1] = (uint8_t)(apdu.rlen - apdu.ne);
             }
-#ifndef ENABLE_EMULATION
-#ifdef USB_ITF_HID
-            if (itf == ITF_HID_CTAP) {
-                driver_exec_finished_cont_hid(itf, (uint16_t)(apdu.ne + 2), (uint16_t)(rdata_gr - apdu.ne - apdu.rdata));
-            }
-#endif
-#ifdef USB_ITF_CCID
-            if (itf == ITF_SC_CCID || itf == ITF_SC_WCID) {
-                driver_exec_finished_cont_ccid(itf, (uint16_t)(apdu.ne + 2), (uint16_t)(rdata_gr - apdu.ne - apdu.rdata));
-            }
-#endif
-#else
-            driver_exec_finished_cont_emul(itf, (uint16_t)(apdu.ne + 2), (uint16_t)(rdata_gr - apdu.ne - apdu.rdata));
-#endif
+            finish_continuation(itf, (uint16_t)(apdu.ne + 2),
+                                (uint16_t)(rdata_gr - apdu.ne - apdu.rdata));
             apdu.rlen -= (uint16_t)apdu.ne;
             response_pending = true;
         }
@@ -280,10 +350,8 @@ done:   ;
 #endif
     }
     //printf("EXIT !!!!!!\n");
-    if (current_app && current_app->unload) {
-        current_app->unload();
-        current_app = NULL;
-    }
+    // A worker change is scheduling, not a smart-card deselect. The USB
+    // transport owns application selection and explicit session resets.
     return NULL;
 }
 

@@ -53,8 +53,17 @@
 
 #define EV_PRESS_BUTTON_TIMEOUT_SHIFT 8 // Upper byte carries the timeout in seconds.
 #define EV_PRESS_BUTTON_TIMEOUT_MASK (0xffu << EV_PRESS_BUTTON_TIMEOUT_SHIFT)
-#define EV_PRESS_BUTTON_WITH_TIMEOUT(seconds) (EV_PRESS_BUTTON | (((uint32_t)(seconds) & 0xffu) << EV_PRESS_BUTTON_TIMEOUT_SHIFT))
+#define EV_PRESS_BUTTON_EXPLICIT_TIMEOUT (1u << 16)
+#define EV_PRESS_BUTTON_WITH_TIMEOUT(seconds) (EV_PRESS_BUTTON | EV_PRESS_BUTTON_EXPLICIT_TIMEOUT | (((uint32_t)(seconds) & 0xffu) << EV_PRESS_BUTTON_TIMEOUT_SHIFT))
 #define EV_PRESS_BUTTON_GET_TIMEOUT(event) (((event) & EV_PRESS_BUTTON_TIMEOUT_MASK) >> EV_PRESS_BUTTON_TIMEOUT_SHIFT)
+
+// Indices 0–4 are reserved for device metadata and MAC.
+#define USB_INTERFACE_STRING_BASE 5
+#ifdef ESP_PLATFORM
+#define USB_STRING_SLOT_COUNT 8 // esp_tinyusb 2.x
+#else
+#define USB_STRING_SLOT_COUNT 10
+#endif
 
 enum { ITF_INVALID = 0xFF };
 
@@ -89,11 +98,14 @@ enum {
 #endif
 
 extern void usb_task(void);
+extern bool card_busy_on_other_interface(uint8_t itf);
 extern queue_t usb_to_card_q;
 extern queue_t card_to_usb_q;
 
 extern void card_start(uint8_t, void *(*func)(void *));
 extern void card_exit(void);
+extern void card_reset_app(uint8_t itf);
+bool card_claim_apdu_context(uint8_t itf);
 extern int card_status(uint8_t itf);
 extern void usb_init(void);
 
@@ -145,5 +157,9 @@ extern int lwip_itf_init(void);
 extern void service_traffic(void);
 extern void rest_task(void);
 #endif
+
+// Called from the serialized USB class reset callback, never from an ISR.
+void usb_session_reset_request(void);
+bool usb_session_reset_pending(void);
 
 #endif

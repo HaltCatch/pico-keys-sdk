@@ -1,3 +1,6 @@
 *.DS_Store*
 build*/
 
+/third-party/cjson/
+/third-party/mlkem/
+/third-party/mldsa/

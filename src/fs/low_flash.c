@@ -55,7 +55,7 @@
   #include "compat/queue.h"
  #endif
  #ifdef ENABLE_EMULATION
-    #define FLASH_SECTOR_SIZE       0x4000
+    #define FLASH_SECTOR_SIZE       0x1000
     #define FLASH_PAGE_SIZE         0x400
  #else
     #define FLASH_SECTOR_SIZE       0x1000
@@ -598,9 +598,20 @@ void low_flash_init(void) {
     data_end_addr += XIP_BASE;
 #else
     fd_map = open("memory.flash", O_RDWR | O_CREAT, (mode_t) 0600);
-    lseek(fd_map, FLASH_SIZE_BYTES - 1, SEEK_SET);
-    write(fd_map, "", 1);
+    if (fd_map < 0) { perror("open memory.flash"); abort(); }
+    // Grow a new/short image without overwriting the final byte on every boot.
+    long image_size = lseek(fd_map, 0, SEEK_END);
+    if (image_size < 0 || image_size > FLASH_SIZE_BYTES) {
+        fprintf(stderr, "Invalid memory.flash size\n");
+        abort();
+    }
+    if (image_size < FLASH_SIZE_BYTES &&
+        (lseek(fd_map, FLASH_SIZE_BYTES - 1, SEEK_SET) < 0 || write(fd_map, "", 1) != 1)) {
+        perror("extend memory.flash");
+        abort();
+    }
     map = mmap(0, FLASH_SIZE_BYTES, PROT_READ | PROT_WRITE, MAP_SHARED, fd_map, 0);
+    if (map == MAP_FAILED) { perror("map memory.flash"); abort(); }
     data_start_addr = 0;
     data_end_addr = FLASH_SIZE_BYTES;
 #endif
@@ -648,7 +659,8 @@ bool low_flash_commit_sync(uint32_t timeout_ms) {
 #elif defined(PICO_PLATFORM)
         tight_loop_contents();
 #elif defined(ESP_PLATFORM)
-        vTaskDelay(1);
+        if (hcore0 == NULL) low_flash_task();
+        else vTaskDelay(1);
 #endif
     }
     return true;

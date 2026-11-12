@@ -1,0 +1,3 @@
+#pragma once
+/* TinyCBOR is linked statically in firmware and emulation. */
+#define CBOR_API

@@ -25,6 +25,11 @@
 #include "emulation.h"
 #elif defined(ESP_PLATFORM)
 #include "driver/gpio.h"
+#include "esp_heap_caps.h"
+#include "esp_log.h"
+#include "esp_system.h"
+#include "esp_timer.h"
+#include "sd_logger.h"
 #include "rom/gpio.h"
 #include "tinyusb.h"
 #elif defined(PICO_PLATFORM)
@@ -101,9 +106,18 @@ int select_app(const_byte_array_t aid) {
 }
 
 
+#ifdef ESP_PLATFORM
+__attribute__((weak)) bool picokey_sd_logger_pins(sd_logger_pins_t *pins) {
+    (void)pins;
+    return false;
+}
+#endif
+
 WEAK int picokey_init(void) {
     return 0;
 }
+WEAK void picokey_boot_message(const char *message) { (void)message; }
+WEAK void picokey_boot_complete(void) {}
 
 void execute_tasks(void);
 void execute_tasks(void) {
@@ -123,6 +137,36 @@ void execute_tasks(void) {
 #endif
 }
 
+#if defined(ESP_PLATFORM) && CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS && \
+    CONFIG_FREERTOS_RUN_TIME_STATS_USING_ESP_TIMER && !CONFIG_FREERTOS_SMP && !CONFIG_FREERTOS_UNICORE
+#define REPORT_CPU_AT_BOOT
+static void report_boot_cpu(void) {
+    static unsigned samples;
+    static uint32_t last, last_idle[2];
+    if (samples > 9) return;
+    uint32_t now = (uint32_t)esp_timer_get_time();
+    uint32_t elapsed = now - last;
+    if (last && elapsed < 10000000) return;
+    uint32_t idle[2] = {
+        ulTaskGetIdleRunTimeCounterForCore(0),
+        ulTaskGetIdleRunTimeCounterForCore(1),
+    };
+    if (last) {
+        // The unsigned difference also handles the 32-bit timer wrap.
+        unsigned idle0 = (unsigned)(((uint64_t)(idle[0] - last_idle[0]) * 100) / elapsed);
+        unsigned idle1 = (unsigned)(((uint64_t)(idle[1] - last_idle[1]) * 100) / elapsed);
+        ESP_LOGI("RESOURCES", "scheduler_idle cpu0=%u%% cpu1=%u%% over=%lu ms; heap_min=%u",
+            idle0 > 100 ? 100 : idle0, idle1 > 100 ? 100 : idle1,
+            (unsigned long)(elapsed / 1000),
+            (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    }
+    last = now;
+    last_idle[0] = idle[0];
+    last_idle[1] = idle[1];
+    ++samples;
+}
+#endif
+
 static void core0_loop(void *arg) {
     (void)arg;
 #if defined(ESP_PLATFORM) && defined(USB_ITF_LWIP)
@@ -135,11 +179,18 @@ static void core0_loop(void *arg) {
         hwrng_task();
         flash_task();
         button_task();
+#ifdef ENABLE_EMULATION
+        struct timespec nap = {.tv_nsec = 1000000};
+        nanosleep(&nap, NULL);
+#endif
 #ifdef PICO_PLATFORM
         // Avoid a pure busy loop on core0; gives the system a scheduling hint.
         tight_loop_contents();
 #endif
 #ifdef ESP_PLATFORM
+#ifdef REPORT_CPU_AT_BOOT
+        report_boot_cpu();
+#endif
         vTaskDelay(pdMS_TO_TICKS(10));
 #endif
     }
@@ -148,15 +199,29 @@ static void core0_loop(void *arg) {
 #ifdef ESP_PLATFORM
 extern tinyusb_config_t tusb_cfg;
 extern const uint8_t desc_config[];
-extern char *string_desc_arr[];
-extern char *string_desc_itf[];
+extern const char *string_desc_itf[];
 TaskHandle_t hcore0 = NULL, hcore1 = NULL;
+volatile bool core1_task_running = false;
+WEAK void picokey_board_early_init(void) {}
+
 int app_main(void) {
+    sd_logger_early_init();
+    ESP_LOGI("BOOT", "Reset reason=%d", (int)esp_reset_reason());
+    picokey_board_early_init();
+    picokey_boot_message("SD log card mounting");
+    sd_logger_init();
+    picokey_boot_message(sd_logger_has_error() ? "SD log error: console" :
+        sd_logger_is_mounted() ? "SD log card ready" : "SD N/A: console log");
+#else
+#ifdef TDONGLE_DESKTOP
+int tdongle_protocol_main(void) {
 #else
 int main(void) {
 #endif
+#endif
 
     serial_init();
+    picokey_boot_message("Device identity ready");
 
 #ifndef ENABLE_EMULATION
 #ifdef PICO_PLATFORM
@@ -164,67 +229,120 @@ int main(void) {
     stdio_init_all();
 #endif
 
-#else
-    emul_init("127.0.0.1", 35963);
 #endif
 
     random_init();
 
     otp_init();
+    picokey_boot_message("Device key ready");
 
     low_flash_init();
 
     file_scan_flash();
+    picokey_boot_message("Credential scan ready");
+
+#ifdef TDONGLE_SPLIT_OPENPGP_STORAGE
+    extern int picokey_prepare_storage(void);
+#ifdef ESP_PLATFORM
+    // Before protocol tasks start this task also owns the flash writer.
+    low_flash_init_core1();
+#endif
+    if (picokey_prepare_storage() != PICOKEYS_OK) {
+        picokey_boot_message("ERROR: storage upgrade");
+#ifdef ESP_PLATFORM
+        ESP_LOGE("STORAGE", "Credential storage migration failed; USB will not start");
+#else
+        printf("Credential storage migration failed; USB will not start\n");
+#endif
+        return 5;
+    }
+    picokey_boot_message("Key storage ready");
+#endif
 
     if (rescue_migrate_keydev() != PICOKEYS_OK) {
+        picokey_boot_message("ERROR: attestation key");
+#ifdef ESP_PLATFORM
+        ESP_LOGE("STORAGE", "Device attestation key migration failed");
+#else
         printf("Device attestation key migration failed\n");
+#endif
     }
 
     init_rtc();
 
-#ifndef ENABLE_EMULATION
     phy_init();
-#endif
 
     led_init();
 
     usb_init();
+#ifdef ESP_PLATFORM
+    esp_card_worker_init();
+    // Finish board/OTP initialization before the USB task can accept requests.
+    if (picokey_init() != 0) {
+        picokey_boot_message("ERROR: board keys");
+        return 6;
+    }
+    picokey_boot_message("Board keys ready");
+#endif
 
 #ifndef ENABLE_EMULATION
 #ifdef ESP_PLATFORM
-    gpio_pad_select_gpio(BOOT_PIN);
+    ESP_ERROR_CHECK(gpio_reset_pin(BOOT_PIN));
     gpio_set_direction(BOOT_PIN, GPIO_MODE_INPUT);
     gpio_pulldown_dis(BOOT_PIN);
 
-    tusb_cfg.string_descriptor[3] = pico_serial_str;
+    tusb_cfg.descriptor.string[3] = pico_serial_str;
     if (phy_data.usb_product_present) {
-        tusb_cfg.string_descriptor[2] = phy_data.usb_product;
+        tusb_cfg.descriptor.string[2] = phy_data.usb_product;
     }
-    static char tmps[5][32];
-    const int max_desc_slots = 8 - 6;
-    const int itf_desc_count = ITF_TOTAL < max_desc_slots ? ITF_TOTAL : max_desc_slots;
-    for (int i = 0; i < itf_desc_count; i++) {
-        strlcpy(tmps[i], tusb_cfg.string_descriptor[2], sizeof(tmps[0]));
-        strlcat(tmps[i], " ", sizeof(tmps[0]));
-        strlcat(tmps[i], string_desc_itf[i], sizeof(tmps[0]));
-        tusb_cfg.string_descriptor[i+6] = tmps[i];
+    enum { MAX_INTERFACE_STRINGS = USB_STRING_SLOT_COUNT - USB_INTERFACE_STRING_BASE };
+    static char interface_strings[MAX_INTERFACE_STRINGS][32];
+    unsigned count = ITF_TOTAL < MAX_INTERFACE_STRINGS ? ITF_TOTAL : MAX_INTERFACE_STRINGS;
+    for (unsigned i = 0; i < count; ++i) {
+        snprintf(interface_strings[i], sizeof(interface_strings[i]), "%s %s",
+            tusb_cfg.descriptor.string[2], string_desc_itf[i]);
+        tusb_cfg.descriptor.string[USB_INTERFACE_STRING_BASE + i] = interface_strings[i];
     }
-    tusb_cfg.string_descriptor_count = 6 + itf_desc_count;
-    tusb_cfg.configuration_descriptor = desc_config;
+    tusb_cfg.descriptor.string_count = USB_INTERFACE_STRING_BASE + count;
+    tusb_cfg.descriptor.full_speed_config = desc_config;
 
-    tinyusb_driver_install(&tusb_cfg);
+    ESP_ERROR_CHECK(tinyusb_driver_install(&tusb_cfg));
+    picokey_boot_message("USB stack ready");
 #else
     tusb_init();
 #endif
 #endif
 
-#ifndef ENABLE_EMULATION
-    picokey_init();
+#ifndef ESP_PLATFORM
+    if (picokey_init() != 0) {
+        picokey_boot_message("ERROR: board keys");
+        return 6;
+    }
+#endif
+#ifdef ENABLE_EMULATION
+    // The control receiver runs on its own thread. Do not expose it until
+    // storage, transport buffers and cached OTP status are initialized.
+    if (emul_init("127.0.0.1", 35963) != 0) return 4;
+    picokey_boot_message("Loopback ports ready");
+    led_set_mode(MODE_MOUNTED);
 #endif
 
 #ifdef ESP_PLATFORM
-    xTaskCreatePinnedToCore(core0_loop, "core0", 4096*ITF_TOTAL*2, NULL, CONFIG_TINYUSB_TASK_PRIORITY - 1, &hcore0, ESP32_CORE0);
+    if (xTaskCreatePinnedToCore(core0_loop, "core0", 4096*ITF_TOTAL*2, NULL, PICOKEYS_USB_TASK_PRIORITY - 1, &hcore0, ESP32_CORE0) != pdPASS) {
+        picokey_boot_message("ERROR: protocol task");
+        return 7;
+    }
+    picokey_boot_message("Protocols ready");
+    picokey_boot_complete();
+    ESP_LOGI("RESOURCES", "startup_stack_min=%u bytes", (unsigned)uxTaskGetStackHighWaterMark(NULL));
+    const uint32_t caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+    ESP_LOGI("RESOURCES", "internal_heap_free=%u min=%u largest=%u; credential_fs_used=%lu free=%lu",
+        (unsigned)heap_caps_get_free_size(caps), (unsigned)heap_caps_get_minimum_free_size(caps),
+        (unsigned)heap_caps_get_largest_free_block(caps), (unsigned long)flash_used_space(),
+        (unsigned long)flash_free_space());
 #else
+    picokey_boot_message("Protocols ready");
+    picokey_boot_complete();
     core0_loop(NULL);
 #endif
 

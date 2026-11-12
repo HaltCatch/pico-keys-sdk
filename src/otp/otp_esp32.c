@@ -30,15 +30,21 @@
 #define OTP_KEY_1    EFUSE_BLK_KEY3
 #define OTP_KEY_2    EFUSE_BLK_KEY4
 
+#ifndef PICOKEYS_ESP32_EFUSE_WRITES
+#define PICOKEYS_ESP32_EFUSE_WRITES 0
+#endif
+
 uint8_t _otp_key_1[32] = {0};
 uint8_t _otp_key_2[32] = {0};
 
+#if PICOKEYS_ESP32_EFUSE_WRITES
 static const uint8_t esp_secure_boot_digest[32] = {
     0x0c, 0x1e, 0xce, 0xf3, 0xb4, 0x8f, 0x4a, 0x81,
     0x45, 0x6c, 0x85, 0x39, 0x15, 0xcc, 0x05, 0x36,
     0xbe, 0x23, 0x24, 0xee, 0xac, 0x8e, 0x3b, 0xb5,
     0x77, 0x6f, 0x2d, 0xb9, 0x62, 0x38, 0x75, 0x6a
 };
+#endif
 
 #ifndef SECURE_BOOT_BOOTKEY_INDEX
 #define SECURE_BOOT_BOOTKEY_INDEX 0
@@ -72,6 +78,7 @@ static bool esp_find_secure_boot_block(uint8_t digest_idx, esp_efuse_block_t *ou
     return false;
 }
 
+#if PICOKEYS_ESP32_EFUSE_WRITES
 static esp_err_t esp_provision_secure_boot_digest(uint8_t digest_idx, esp_efuse_block_t *out_block) {
     esp_efuse_purpose_t purpose = esp_secure_boot_purpose(digest_idx);
     if (purpose == ESP_EFUSE_KEY_PURPOSE_MAX) {
@@ -166,6 +173,7 @@ static esp_err_t esp_disable_debug_interfaces(void) {
 
     return err;
 }
+#endif
 
 static esp_err_t read_key_from_efuse(esp_efuse_block_t block, byte_array_t key) {
     const esp_efuse_desc_t **key_desc = esp_efuse_get_key(block);
@@ -218,6 +226,11 @@ bool otp_platform_is_secure_boot_locked(void) {
 }
 
 int otp_platform_enable_secure_boot(uint8_t bootkey, bool secure_lock) {
+#if !PICOKEYS_ESP32_EFUSE_WRITES
+    (void)bootkey;
+    (void)secure_lock;
+    return PICOKEYS_EXEC_ERROR;
+#else
     if (bootkey > 2) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -281,9 +294,38 @@ int otp_platform_enable_secure_boot(uint8_t bootkey, bool secure_lock) {
     }
 
     return PICOKEYS_OK;
+#endif
 }
 
 void otp_platform_init(const uint8_t **otp_key_1_out, const uint8_t **otp_key_2_out) {
+#if !PICOKEYS_ESP32_EFUSE_WRITES
+    *otp_key_1_out = NULL;
+    *otp_key_2_out = NULL;
+    if (esp_efuse_key_block_unused(OTP_KEY_1) ||
+        esp_efuse_get_key_purpose(OTP_KEY_1) != ESP_EFUSE_KEY_PURPOSE_USER ||
+        read_key_from_efuse(OTP_KEY_1, BYTE_ARRAY(_otp_key_1, sizeof(_otp_key_1))) != ESP_OK) {
+        printf("OTP root absent or unreadable; eFuse writes disabled.\n");
+        abort();
+    }
+    bool all_zero = true, all_ff = true;
+    for (size_t i = 0; i < sizeof(_otp_key_1); ++i) {
+        all_zero &= _otp_key_1[i] == 0;
+        all_ff &= _otp_key_1[i] == 0xff;
+    }
+    if (all_zero || all_ff) {
+        printf("OTP root invalid; refusing a replacement root.\n");
+        abort();
+    }
+    *otp_key_1_out = _otp_key_1;
+    if (!esp_efuse_key_block_unused(OTP_KEY_2)) {
+        if (esp_efuse_get_key_purpose(OTP_KEY_2) != ESP_EFUSE_KEY_PURPOSE_USER ||
+            read_key_from_efuse(OTP_KEY_2, BYTE_ARRAY(_otp_key_2, sizeof(_otp_key_2))) != ESP_OK) {
+            printf("Device key unreadable; refusing a replacement key.\n");
+            abort();
+        }
+        *otp_key_2_out = _otp_key_2;
+    }
+#else
     esp_err_t ret = 0;
     uint16_t write_otp[2] = {0xFFFF, 0xFFFF};
 
@@ -339,4 +381,5 @@ void otp_platform_init(const uint8_t **otp_key_1_out, const uint8_t **otp_key_2_
             }
         }
     }
+#endif
 }

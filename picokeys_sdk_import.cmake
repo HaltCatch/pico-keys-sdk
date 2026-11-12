@@ -18,6 +18,15 @@
 include(pico-keys-sdk/cmake/version.cmake OPTIONAL)
 include(pico-keys-sdk/cmake/options.cmake OPTIONAL)
 
+option(PICOKEYS_RP2350_OTP_WRITES "Allow irreversible RP2350 OTP provisioning and secure-boot writes" OFF)
+if(PICOKEYS_RP2350_OTP_WRITES)
+    add_compile_definitions(PICOKEYS_RP2350_OTP_WRITES=1)
+endif()
+option(PICOKEYS_ESP32_EFUSE_WRITES "Allow irreversible ESP32 eFuse provisioning and secure-boot writes" OFF)
+if(PICOKEYS_ESP32_EFUSE_WRITES)
+    add_compile_definitions(PICOKEYS_ESP32_EFUSE_WRITES=1)
+endif()
+
 option(VIDPID "Set specific VID/PID from a known platform {NitroHSM, NitroFIDO2, NitroStart, NitroPro, Nitro3, Yubikey5, YubikeyNeo, YubiHSM, Gnuk, GnuPG}" "None")
 
 message(STATUS "VIDPID:\t\t\t '${VIDPID}'")
@@ -40,6 +49,7 @@ elseif(VIDPID STREQUAL "Nitro3")
 elseif(VIDPID STREQUAL "Yubikey5")
     set(USB_VID 0x1050)
     set(USB_PID 0x0407)
+    add_compile_definitions(PICOKEYS_YUBIKEY_COMPAT=1)
 elseif(VIDPID STREQUAL "YubikeyNeo")
     set(USB_VID 0x1050)
     set(USB_PID 0x0116)
@@ -140,13 +150,24 @@ if(USB_ITF_LWIP)
     message(STATUS "USB LWIP Interface:\t\t enabled")
 endif()
 if(ESP_PLATFORM)
-    add_compile_definitions(MBEDTLS_AES_ALT=1)
-    add_compile_definitions(MBEDTLS_GCM_ALT=1)
-    add_compile_definitions(MBEDTLS_SHA256_ALT=1)
-    add_compile_definitions(MBEDTLS_SHA1_ALT=1)
-    add_compile_definitions(MBEDTLS_SHA512_ALT=1)
-    add_compile_definitions(MBEDTLS_MPI_EXP_MOD_ALT=1)
-    add_compile_definitions(MBEDTLS_MPI_MUL_MPI_ALT=1)
+    option(PICOKEYS_REQUIRE_HARDWARE_CRYPTO "Reject a build without the legacy hardware crypto adapter" OFF)
+    # ESP-IDF 6 switched its hardware crypto glue to the PSA API. The
+    # EdDSA-enabled 3.6 library uses its own implementations on that toolchain.
+    if(EXISTS "$ENV{IDF_PATH}/components/mbedtls/port/include/aes_alt.h")
+        add_compile_definitions(MBEDTLS_AES_ALT=1)
+        add_compile_definitions(MBEDTLS_GCM_ALT=1)
+        add_compile_definitions(MBEDTLS_SHA256_ALT=1)
+        add_compile_definitions(MBEDTLS_SHA1_ALT=1)
+        add_compile_definitions(MBEDTLS_SHA512_ALT=1)
+        add_compile_definitions(MBEDTLS_MPI_EXP_MOD_ALT=1)
+        add_compile_definitions(MBEDTLS_MPI_MUL_MPI_ALT=1)
+    else()
+        if(PICOKEYS_REQUIRE_HARDWARE_CRYPTO)
+            message(FATAL_ERROR "This IDF version requires a reviewed PSA hardware adapter for the pinned EdDSA library; hardware crypto cannot be claimed by sdkconfig alone")
+        endif()
+        message(STATUS "Crypto backend: pinned Mbed TLS software; IDF hardware AES/SHA/MPI options do not enable acceleration in this adapter")
+        add_compile_definitions(MBEDTLS_PSA_CRYPTO_C=1 MBEDTLS_PSA_CRYPTO_EXTERNAL_RNG=1 MBEDTLS_PSA_DRIVER_GET_ENTROPY=1)
+    endif()
     add_compile_definitions(CFG_TUSB_CONFIG_FILE="${CMAKE_CURRENT_LIST_DIR}/src/usb/tusb_config.h")
 endif()
 add_compile_definitions(DEBUG_APDU=${DEBUG_APDU})
@@ -170,6 +191,7 @@ if(ENABLE_PQC)
     add_compile_definitions(ENABLE_PQC)
 endif()
 
+include(${CMAKE_CURRENT_LIST_DIR}/config/mbedtls_edwards.cmake)
 set(MBEDTLS_SOURCES
     ${CMAKE_CURRENT_LIST_DIR}/third-party/mbedtls/library/aes.c
     ${CMAKE_CURRENT_LIST_DIR}/third-party/mbedtls/library/asn1parse.c
@@ -183,7 +205,7 @@ set(MBEDTLS_SOURCES
     ${CMAKE_CURRENT_LIST_DIR}/third-party/mbedtls/library/constant_time.c
     ${CMAKE_CURRENT_LIST_DIR}/third-party/mbedtls/library/ecdsa.c
     ${CMAKE_CURRENT_LIST_DIR}/third-party/mbedtls/library/ecdh.c
-    ${CMAKE_CURRENT_LIST_DIR}/third-party/mbedtls/library/ecp.c
+    ${PICOKEYS_ECP_SOURCE}
     ${CMAKE_CURRENT_LIST_DIR}/third-party/mbedtls/library/ecp_curves.c
     ${CMAKE_CURRENT_LIST_DIR}/third-party/mbedtls/library/gcm.c
     ${CMAKE_CURRENT_LIST_DIR}/third-party/mbedtls/library/hkdf.c
@@ -329,7 +351,9 @@ if(ESP_PLATFORM)
         ${CMAKE_CURRENT_LIST_DIR}/src/otp/otp_esp32.c
     )
 elseif(ENABLE_EMULATION)
-    if(MSVC)
+    if(PICOKEYS_EMULATION_SOFTWARE_OTP)
+        list(APPEND PICOKEYS_SOURCES ${CMAKE_CURRENT_LIST_DIR}/src/otp/otp_emulation.c)
+    elseif(MSVC)
         list(APPEND PICOKEYS_SOURCES
             ${CMAKE_CURRENT_LIST_DIR}/src/otp/otp_windows.c
         )
@@ -390,6 +414,8 @@ list(APPEND PICOKEYS_SOURCES
 
 if(ESP_PLATFORM)
     list(APPEND PICOKEYS_SOURCES
+        ${CMAKE_CURRENT_LIST_DIR}/src/sd_logger.c
+        ${CMAKE_CURRENT_LIST_DIR}/src/led/led_apa102.c
         ${CMAKE_CURRENT_LIST_DIR}/src/led/led_neopixel.c
         ${CMAKE_CURRENT_LIST_DIR}/src/led/led_pico.c
     )
@@ -426,8 +452,17 @@ set(SYSTEM_INCLUDES
     ${CMAKE_CURRENT_LIST_DIR}/third-party/mbedtls/include
 )
 if(USB_ITF_HID)
+    # TinyCBOR 7 uses generated headers even in the static embedded profile.
+    set(TINYCBOR_GENERATED_DIR "${CMAKE_BINARY_DIR}/generated/tinycbor")
+    set(TINYCBOR_VERSION_MAJOR 7)
+    set(TINYCBOR_VERSION_MINOR 1)
+    configure_file("${CMAKE_CURRENT_LIST_DIR}/cmake/tinycbor-export.h.in"
+                   "${TINYCBOR_GENERATED_DIR}/tinycbor-export.h" COPYONLY)
+    configure_file("${CMAKE_CURRENT_LIST_DIR}/cmake/tinycbor-version.h.in"
+                   "${TINYCBOR_GENERATED_DIR}/tinycbor-version.h" @ONLY)
     list(APPEND SYSTEM_INCLUDES
         ${CMAKE_CURRENT_LIST_DIR}/third-party/tinycbor/src
+        ${TINYCBOR_GENERATED_DIR}
     )
 endif()
 if(USB_ITF_LWIP)
@@ -468,6 +503,7 @@ endif()
 
 set(CBOR_SOURCES
     ${CMAKE_CURRENT_LIST_DIR}/third-party/tinycbor/src/cborencoder.c
+    ${CMAKE_CURRENT_LIST_DIR}/third-party/tinycbor/src/cborencoder_close_container_checked.c
     ${CMAKE_CURRENT_LIST_DIR}/third-party/tinycbor/src/cborparser.c
     ${CMAKE_CURRENT_LIST_DIR}/third-party/tinycbor/src/cborparser_dup_string.c
 )
@@ -492,7 +528,7 @@ if(USE_OPENSSL_EMULATION_WRAPPER)
     list(APPEND LIBRARIES OpenSSL::Crypto)
 endif()
 
-if(UNIX AND NOT APPLE AND ENABLE_EMULATION)
+if(UNIX AND NOT APPLE AND ENABLE_EMULATION AND NOT PICOKEYS_EMULATION_SOFTWARE_OTP)
     find_library(TSS2_ESYS_LIB NAMES tss2-esys)
     find_library(TSS2_TCTILDR_LIB NAMES tss2-tctildr)
     if(TSS2_ESYS_LIB AND TSS2_TCTILDR_LIB)
@@ -505,6 +541,7 @@ endif()
 if(NOT ESP_PLATFORM)
     if(NOT SKIP_MBEDTLS_FOR_OPENSSL_EMULATION)
         add_library(mbedtls STATIC ${MBEDTLS_SOURCES})
+        target_include_directories(mbedtls PRIVATE ${CMAKE_CURRENT_LIST_DIR}/third-party/mbedtls/library)
         target_include_directories(mbedtls SYSTEM PUBLIC ${CMAKE_CURRENT_LIST_DIR}/third-party/mbedtls/include)
     endif()
     if(ENABLE_LIBCVC)
@@ -515,7 +552,7 @@ if(NOT ESP_PLATFORM)
     endif()
     if(USB_ITF_HID)
         add_library(tinycbor STATIC ${CBOR_SOURCES})
-        target_include_directories(tinycbor SYSTEM PUBLIC ${CMAKE_CURRENT_LIST_DIR}/third-party/tinycbor/src)
+        target_include_directories(tinycbor SYSTEM PUBLIC ${CMAKE_CURRENT_LIST_DIR}/third-party/tinycbor/src ${TINYCBOR_GENERATED_DIR})
         list(APPEND LIBRARIES tinycbor)
     endif()
     if(USB_ITF_LWIP)
@@ -657,7 +694,9 @@ if(ESP_PLATFORM)
         ${CMAKE_CURRENT_LIST_DIR}/src/otp/otp_esp32.c
     )
 elseif(ENABLE_EMULATION)
-    if(MSVC)
+    if(PICOKEYS_EMULATION_SOFTWARE_OTP)
+        list(APPEND PICOKEYS_SOURCES ${CMAKE_CURRENT_LIST_DIR}/src/otp/otp_emulation.c)
+    elseif(MSVC)
         list(APPEND PICOKEYS_SOURCES
             ${CMAKE_CURRENT_LIST_DIR}/src/otp/otp_windows.c
         )

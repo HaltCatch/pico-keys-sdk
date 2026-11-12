@@ -20,7 +20,7 @@
 #if !defined(PICO_PLATFORM)
 #define XIP_BASE                0
 #ifdef ENABLE_EMULATION
-#define FLASH_SECTOR_SIZE       0x4000
+#define FLASH_SECTOR_SIZE       0x1000
 #else
 #define FLASH_SECTOR_SIZE       0x1000
 #endif

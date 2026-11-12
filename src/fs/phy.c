@@ -18,7 +18,6 @@
 #include "picokeys.h"
 #include "otp.h"
 
-#ifndef ENABLE_EMULATION
 
 phy_data_t phy_data;
 
@@ -205,4 +204,3 @@ int phy_load(void) {
     }
     return PICOKEYS_OK;
 }
-#endif

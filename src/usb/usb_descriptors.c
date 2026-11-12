@@ -165,6 +165,11 @@ uint8_t const *tud_hid_descriptor_report_cb(uint8_t itf) {
 }
 #endif
 
+static uint8_t interface_string_index(uint8_t itf) {
+    const unsigned index = USB_INTERFACE_STRING_BASE + itf;
+    return index < USB_STRING_SLOT_COUNT ? (uint8_t)index : 0;
+}
+
 void usb_desc_setup(void) {
     desc_config[4] = ITF_TOTAL;
     TUSB_DESC_TOTAL_LEN = TUD_CONFIG_DESC_LEN;
@@ -172,13 +177,13 @@ void usb_desc_setup(void) {
 #ifdef USB_ITF_HID
     if (ITF_HID != ITF_INVALID) {
         TUSB_DESC_TOTAL_LEN += TUD_HID_INOUT_DESC_LEN;
-        const uint8_t desc[] = { TUD_HID_INOUT_DESCRIPTOR(ITF_HID, ITF_HID + 5, HID_ITF_PROTOCOL_NONE, sizeof(desc_hid_report), EPNUM_HID, (uint8_t)TUSB_DIR_IN_MASK | EPNUM_HID, CFG_TUD_HID_EP_BUFSIZE, 10) };
+        const uint8_t desc[] = { TUD_HID_INOUT_DESCRIPTOR(ITF_HID, interface_string_index(ITF_HID), HID_ITF_PROTOCOL_NONE, sizeof(desc_hid_report), EPNUM_HID, (uint8_t)TUSB_DIR_IN_MASK | EPNUM_HID, CFG_TUD_HID_EP_BUFSIZE, 10) };
         memcpy(p, desc, sizeof(desc));
         p += sizeof(desc);
     }
     if (ITF_KEYBOARD != ITF_INVALID) {
         TUSB_DESC_TOTAL_LEN += TUD_HID_DESC_LEN;
-        const uint8_t desc_kb[] = { TUD_HID_DESCRIPTOR(ITF_KEYBOARD, ITF_KEYBOARD + 5, HID_ITF_PROTOCOL_NONE, sizeof(desc_hid_report_kb), (uint8_t)TUSB_DIR_IN_MASK | EPNUM_HID_KB, 16, 5) };
+        const uint8_t desc_kb[] = { TUD_HID_DESCRIPTOR(ITF_KEYBOARD, interface_string_index(ITF_KEYBOARD), HID_ITF_PROTOCOL_NONE, sizeof(desc_hid_report_kb), (uint8_t)TUSB_DIR_IN_MASK | EPNUM_HID_KB, 16, 5) };
         memcpy(p, desc_kb, sizeof(desc_kb));
         p += sizeof(desc_kb);
     }
@@ -186,13 +191,13 @@ void usb_desc_setup(void) {
 #ifdef USB_ITF_CCID
     if (ITF_CCID != ITF_INVALID) {
         TUSB_DESC_TOTAL_LEN += TUSB_SMARTCARD_CCID_DESC_LEN;
-        const uint8_t desc_ccid[] = { TUD_SMARTCARD_DESCRIPTOR(ITF_CCID, ITF_CCID + 5, EPNUM_CCID, TUSB_DIR_IN_MASK | EPNUM_CCID, TUSB_DIR_IN_MASK | EPNUM_CCID_INT, 64) };
+        const uint8_t desc_ccid[] = { TUD_SMARTCARD_DESCRIPTOR(ITF_CCID, interface_string_index(ITF_CCID), EPNUM_CCID, TUSB_DIR_IN_MASK | EPNUM_CCID, TUSB_DIR_IN_MASK | EPNUM_CCID_INT, 64) };
         memcpy(p, desc_ccid, sizeof(desc_ccid));
         p += sizeof(desc_ccid);
     }
     if (ITF_WCID != ITF_INVALID) {
         TUSB_DESC_TOTAL_LEN += TUSB_SMARTCARD_WCID_DESC_LEN;
-        const uint8_t desc_wcid[] = { TUD_SMARTCARD_DESCRIPTOR_WEB(ITF_WCID, ITF_WCID + 5, EPNUM_WCID, TUSB_DIR_IN_MASK | EPNUM_WCID, 64) };
+        const uint8_t desc_wcid[] = { TUD_SMARTCARD_DESCRIPTOR_WEB(ITF_WCID, interface_string_index(ITF_WCID), EPNUM_WCID, TUSB_DIR_IN_MASK | EPNUM_WCID, 64) };
         memcpy(p, desc_wcid, sizeof(desc_wcid));
         p += sizeof(desc_wcid);
     }
@@ -200,7 +205,7 @@ void usb_desc_setup(void) {
 #ifdef USB_ITF_LWIP
     if (ITF_LWIP != ITF_INVALID) {
         TUSB_DESC_TOTAL_LEN += TUD_CDC_NCM_DESC_LEN;
-        const uint8_t desc_lwip[] = { TUD_CDC_NCM_DESCRIPTOR(ITF_LWIP, ITF_LWIP + 5, 4, EPNUM_LWIP_NOTIF | TUSB_DIR_IN_MASK, 64, EPNUM_LWIP, EPNUM_LWIP | TUSB_DIR_IN_MASK, CFG_TUD_NET_ENDPOINT_SIZE, CFG_TUD_NET_MTU) };
+        const uint8_t desc_lwip[] = { TUD_CDC_NCM_DESCRIPTOR(ITF_LWIP, interface_string_index(ITF_LWIP), 4, EPNUM_LWIP_NOTIF | TUSB_DIR_IN_MASK, 64, EPNUM_LWIP, EPNUM_LWIP | TUSB_DIR_IN_MASK, CFG_TUD_NET_ENDPOINT_SIZE, CFG_TUD_NET_MTU) };
         memcpy(p, desc_lwip, sizeof(desc_lwip));
         p += sizeof(desc_lwip);
     }
@@ -344,31 +349,53 @@ uint8_t const *tud_descriptor_bos_cb(void) {
 //--------------------------------------------------------------------+
 
 // array of pointer to string descriptors
-char *string_desc_itf[5] = {0};
-char const *string_desc_arr [] = {
-    (const char[]) { 0x09, 0x04 }, // 0: is supported language is English (0x0409)
-    "Pol Henarejos",                     // 1: Manufacturer
-    "Pico Key",                       // 2: Product
-    "11223344",                      // 3: Serials, should use chip ID
-    "MAC"                   // 4: MAC address string, handled separately
-    , "HID Interface"
-    , "HID Keyboard Interface"
-#ifdef USB_ITF_HID
-    , "CCID OTP FIDO Interface"
+const char *string_desc_itf[5] = {0};
+const char *string_desc_arr[USB_STRING_SLOT_COUNT] = {
+    (const char[]) {0x09, 0x04}, // English (0x0409)
+#ifdef PICOKEYS_YUBIKEY_COMPAT
+    // ykman uses a reader-name substring to associate PC/SC with HID. macOS
+    // may omit iInterface, so keep both the compatibility marker and interfaces
+    // in device-level strings. These labels retain our own Pico Keys identity.
+    "Pico Keys/Yubico YubiKey compat",
+    "Pico Key OTP FIDO CCID",
 #else
-    , "CCID Interface"
+    "Pol Henarejos",
+    "Pico Key",
 #endif
-    , "WebCCID Interface"
-    , "Network Interface"
+    "11223344",
+    "MAC",
+};
+
+const char *const usb_interface_names[5] = {
+    "HID Interface",
+    "HID Keyboard Interface",
+#ifdef USB_ITF_HID
+    "CCID OTP FIDO Interface",
+#else
+    "CCID Interface",
+#endif
+    "WebCCID Interface",
+    "Network Interface",
 };
 
 #ifdef ESP_PLATFORM
 tinyusb_config_t tusb_cfg = {
-    .device_descriptor = &desc_device,
-    .string_descriptor = string_desc_arr,
-    .string_descriptor_count = (sizeof(string_desc_arr) / sizeof(string_desc_arr[0])),
-    .external_phy = false,
-    .configuration_descriptor = desc_config,
+    .port = TINYUSB_PORT_FULL_SPEED_0,
+    .task = {
+        .size = 16384,
+        .priority = PICOKEYS_USB_TASK_PRIORITY,
+#if CONFIG_FREERTOS_UNICORE
+        .xCoreID = 0,
+#else
+        .xCoreID = 1,
+#endif
+    },
+    .descriptor = {
+        .device = &desc_device,
+        .string = string_desc_arr,
+        .string_count = USB_INTERFACE_STRING_BASE,
+        .full_speed_config = desc_config,
+    },
 };
 #else
 static uint16_t _desc_str[32];
@@ -399,10 +426,11 @@ uint16_t const *tud_descriptor_string_cb(uint8_t index, uint16_t langid) {
                 str = phy_data.usb_product;
             }
         }
-        else if (index >= 6 && string_desc_itf[index - 6] != NULL) {
-            str = string_desc_itf[index - 6];
+        else if (index >= USB_INTERFACE_STRING_BASE) {
+            str = string_desc_itf[index - USB_INTERFACE_STRING_BASE];
+            if (!str) return NULL;
         }
-        else if (index == 5) {
+        else if (index == 4) {
 #ifdef USB_ITF_LWIP
             chr_count = 0;
             for (unsigned i = 0; i < sizeof(tud_network_mac_address); i++) {
@@ -413,7 +441,7 @@ uint16_t const *tud_descriptor_string_cb(uint8_t index, uint16_t langid) {
         }
 
         uint8_t buff_avail = sizeof(_desc_str) / sizeof(_desc_str[0]) - 1;
-        if (index >= 6) {
+        if (index >= USB_INTERFACE_STRING_BASE) {
             const char *product = phy_data.usb_product_present ? phy_data.usb_product : string_desc_arr[2];
             uint8_t len = (uint8_t)MIN(strlen(product), buff_avail);
             for (size_t ix = 0; ix < len; chr_count++, ix++) {

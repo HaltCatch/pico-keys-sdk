@@ -10,16 +10,14 @@ set(PICO_KEYS_MBEDTLS_PORT_SOURCES
     ${PICO_KEYS_MBEDTLS_PORT_DIR}/esp_hardware.c
     ${PICO_KEYS_MBEDTLS_PORT_DIR}/esp_mem.c
     ${PICO_KEYS_MBEDTLS_PORT_DIR}/esp_platform_time.c
-    ${PICO_KEYS_MBEDTLS_PORT_DIR}/esp_timing.c
 )
 
+set(PICO_KEYS_MBEDTLS_PORT_INCLUDE_DIRS ${PICO_KEYS_MBEDTLS_PORT_DIR}/include)
+if(EXISTS "${PICO_KEYS_MBEDTLS_PORT_DIR}/include/aes_alt.h")
+list(APPEND PICO_KEYS_MBEDTLS_PORT_SOURCES ${PICO_KEYS_MBEDTLS_PORT_DIR}/esp_timing.c)
 if(CONFIG_MBEDTLS_ROM_MD5)
     list(APPEND PICO_KEYS_MBEDTLS_PORT_SOURCES ${PICO_KEYS_MBEDTLS_PORT_DIR}/md/esp_md.c)
 endif()
-
-set(PICO_KEYS_MBEDTLS_PORT_INCLUDE_DIRS
-    ${PICO_KEYS_MBEDTLS_PORT_DIR}/include
-)
 
 if(CONFIG_MBEDTLS_CERTIFICATE_BUNDLE)
     list(APPEND PICO_KEYS_MBEDTLS_PORT_INCLUDE_DIRS ${PICO_KEYS_MBEDTLS_CRT_BUNDLE_DIR}/include)
@@ -96,9 +94,23 @@ if(CONFIG_MBEDTLS_HARDWARE_ECC)
     )
 endif()
 
+else()
+    # IDF 6 uses PSA hashes to inspect app images. Supply them from the same
+    # library as the firmware crypto to avoid mixing incompatible headers/ABIs.
+    set(PICO_KEYS_PSA_GENERATED "${CMAKE_CURRENT_BINARY_DIR}/psa-generated")
+    file(MAKE_DIRECTORY "${PICO_KEYS_PSA_GENERATED}")
+    file(GLOB PICO_KEYS_PSA_SOURCES "${PICO_KEYS_MBEDTLS_DIR}/library/psa_crypto*.c")
+    list(APPEND PICO_KEYS_MBEDTLS_PORT_SOURCES
+        ${PICO_KEYS_PSA_SOURCES}
+        ${PICO_KEYS_MBEDTLS_DIR}/library/psa_util.c
+        ${PICO_KEYS_MBEDTLS_PORT_DIR}/esp_psa_crypto_init.c
+    )
+endif()
+
 idf_component_register(
     SRCS ${MBEDTLS_SOURCES} ${PICO_KEYS_MBEDTLS_PORT_SOURCES}
-    INCLUDE_DIRS ${PICO_KEYS_MBEDTLS_PORT_INCLUDE_DIRS} ${PICO_KEYS_MBEDTLS_DIR}/include
+    INCLUDE_DIRS ${PICO_KEYS_MBEDTLS_DIR}/include ${PICO_KEYS_MBEDTLS_PORT_INCLUDE_DIRS}
+    PRIV_INCLUDE_DIRS ${PICO_KEYS_MBEDTLS_DIR}/library ${PICO_KEYS_PSA_GENERATED}
     PRIV_REQUIRES soc esp_hw_support esp_pm esp_security esp_mm
     KCONFIG "$ENV{IDF_PATH}/components/mbedtls/Kconfig"
 )
@@ -115,4 +127,23 @@ if(CONFIG_MBEDTLS_CERTIFICATE_BUNDLE)
     add_dependencies(${COMPONENT_LIB} pico_keys_mbedtls_bundle)
     target_add_binary_data(${COMPONENT_LIB} ${PICO_KEYS_MBEDTLS_BUNDLE_FILE} BINARY)
     set_property(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" APPEND PROPERTY ADDITIONAL_CLEAN_FILES "${PICO_KEYS_MBEDTLS_BUNDLE_FILE}")
+endif()
+
+
+if(PICO_KEYS_PSA_GENERATED)
+    idf_build_get_property(python PYTHON)
+    file(GLOB_RECURSE PICO_KEYS_PSA_TEMPLATES
+        "${PICO_KEYS_MBEDTLS_DIR}/scripts/data_files/driver_templates/*"
+        "${PICO_KEYS_MBEDTLS_DIR}/scripts/data_files/driver_jsons/*")
+    set(PICO_KEYS_PSA_GENERATOR "${PICO_KEYS_MBEDTLS_DIR}/scripts/generate_driver_wrappers.py")
+    set(PICO_KEYS_PSA_WRAPPERS "${PICO_KEYS_PSA_GENERATED}/psa_crypto_driver_wrappers_no_static.c")
+    add_custom_command(
+        OUTPUT "${PICO_KEYS_PSA_WRAPPERS}" "${PICO_KEYS_PSA_GENERATED}/psa_crypto_driver_wrappers.h"
+        COMMAND "${python}" "${PICO_KEYS_PSA_GENERATOR}"
+                --project-root "${PICO_KEYS_MBEDTLS_DIR}" "${PICO_KEYS_PSA_GENERATED}"
+        DEPENDS "${PICO_KEYS_PSA_GENERATOR}" ${PICO_KEYS_PSA_TEMPLATES}
+        WORKING_DIRECTORY "${PICO_KEYS_MBEDTLS_DIR}"
+        VERBATIM)
+    target_sources(${COMPONENT_LIB} PRIVATE "${PICO_KEYS_PSA_WRAPPERS}")
+    target_link_libraries(${COMPONENT_LIB} INTERFACE "-u mbedtls_psa_crypto_init_include_impl")
 endif()

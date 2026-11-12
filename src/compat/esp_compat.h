@@ -30,7 +30,9 @@ typedef QueueHandle_t queue_t;
 #define queue_try_add(a,b) xQueueSend(*(a), b, 0)
 #define queue_is_empty(a) (uxQueueMessagesWaiting(*(a)) == 0)
 #define queue_try_remove(a,b) xQueueReceive(*(a), b, 0)
+#define queue_try_peek(a,b) xQueuePeek(*(a), b, 0)
 extern TaskHandle_t hcore0, hcore1;
+extern volatile bool core1_task_running;
 #ifdef CONFIG_IDF_TARGET_ESP32S3
 #define ESP32_CORE0 0
 #define ESP32_CORE1 1
@@ -38,13 +40,11 @@ extern TaskHandle_t hcore0, hcore1;
 #define ESP32_CORE0 tskNO_AFFINITY
 #define ESP32_CORE1 tskNO_AFFINITY
 #endif
-static inline void task_wrapper(void *arg) {
-    void* (*func)(void*) = (void* (*)(void*))arg;
-    func(NULL);
-    vTaskDelete(NULL);
-}
-#define multicore_launch_func_core1(func) xTaskCreatePinnedToCore(task_wrapper, "core1", 4096*ITF_TOTAL*2, (void *)func, CONFIG_TINYUSB_TASK_PRIORITY - 2, &hcore1, ESP32_CORE1)
-#define multicore_reset_core1() do { if (hcore1) { eTaskState e = eTaskGetState(hcore1); if (e <= eSuspended) { vTaskDelete(hcore1); }} }while(0)
+#define PICOKEYS_USB_TASK_PRIORITY 5
+void esp_card_worker_init(void);
+void esp_card_worker_launch(void *(*func)(void *));
+#define multicore_launch_func_core1(func) esp_card_worker_launch(func)
+#define multicore_reset_core1() do { while (core1_task_running) { vTaskDelay(1); } } while (0)
 #define sleep_ms(a) vTaskDelay(a / portTICK_PERIOD_MS)
 static inline uint32_t board_millis(void) {
     return ( ( ((uint64_t) xTaskGetTickCount()) * 1000) / configTICK_RATE_HZ );

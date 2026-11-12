@@ -28,7 +28,7 @@
 #include <time.h>
 #endif
 
-#if defined(__APPLE__) && !(defined(ENABLE_EMULATION) && defined(__FOR_CI))
+#if defined(__APPLE__) && !defined(TDONGLE_DESKTOP) && !(defined(ENABLE_EMULATION) && defined(__FOR_CI))
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
 
@@ -57,7 +57,7 @@ static int get_macos_serial(uint8_t *out) {
     }
     return ok ? 0 : -4;
 }
-#elif defined(_MSC_VER) && !(defined(ENABLE_EMULATION) && defined(__FOR_CI))
+#elif defined(_MSC_VER) && !defined(TDONGLE_DESKTOP) && !(defined(ENABLE_EMULATION) && defined(__FOR_CI))
 #include <windows.h>
 #include <wbemidl.h>
 
@@ -130,7 +130,7 @@ static int get_system_uuid(char *out) {
     }
     return serial[0] ? 0 : -8;
 }
-#elif defined(__linux__) && !(defined(ENABLE_EMULATION) && defined(__FOR_CI))
+#elif defined(__linux__) && !defined(TDONGLE_DESKTOP) && !(defined(ENABLE_EMULATION) && defined(__FOR_CI))
 #include <string.h>
 #include <ctype.h>
 
@@ -239,18 +239,20 @@ static int serial_id_is_zero(const_byte_array_t id) {
 
 #if defined(ESP_PLATFORM)
 #define pico_get_unique_board_id(a) do { uint32_t value; esp_efuse_read_block(EFUSE_BLK1, &value, 0, 32); memcpy((uint8_t *)(a), &value, sizeof(uint32_t)); esp_efuse_read_block(EFUSE_BLK1, &value, 32, 32); memcpy((uint8_t *)(a)+4, &value, sizeof(uint32_t)); } while(0)
-#elif defined(__APPLE__) && !(defined(ENABLE_EMULATION) && defined(__FOR_CI))
+#elif defined(__APPLE__) && !defined(TDONGLE_DESKTOP) && !(defined(ENABLE_EMULATION) && defined(__FOR_CI))
 #define pico_get_unique_board_id(a) get_macos_serial((uint8_t *)(a))
-#elif defined(_MSC_VER) && !(defined(ENABLE_EMULATION) && defined(__FOR_CI))
+#elif defined(_MSC_VER) && !defined(TDONGLE_DESKTOP) && !(defined(ENABLE_EMULATION) && defined(__FOR_CI))
 #define pico_get_unique_board_id(a) get_system_uuid((char *)(a))
-#elif defined(__linux__) && !(defined(ENABLE_EMULATION) && defined(__FOR_CI))
+#elif defined(__linux__) && !defined(TDONGLE_DESKTOP) && !(defined(ENABLE_EMULATION) && defined(__FOR_CI))
 #define pico_get_unique_board_id(a) get_linux_hardware_id((char *)(a))
 #endif
 
 void serial_init(void) {
     int serial_rc = 0;
 
-#if defined(ENABLE_EMULATION) && defined(__FOR_CI)
+#if defined(TDONGLE_DESKTOP)
+    memset(pico_serial.id, 0, sizeof(pico_serial.id));
+#elif defined(ENABLE_EMULATION) && defined(__FOR_CI)
     serial_rc = get_ci_device_id(pico_serial.id);
 #elif defined(__APPLE__) || defined(_MSC_VER) || defined(__linux__)
     serial_rc = pico_get_unique_board_id(&pico_serial);

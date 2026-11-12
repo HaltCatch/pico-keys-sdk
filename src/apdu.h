@@ -45,6 +45,10 @@ typedef struct cmd {
 extern uint8_t num_apps;
 extern app_t apps[16];
 extern app_t *current_app;
+void apdu_transport_init(void);
+void apdu_select_transport(uint8_t itf);
+void apdu_reset_transport(uint8_t itf);
+bool apdu_transport_can_yield(uint8_t itf);
 
 PACK(struct apdu {
     uint8_t *header;
@@ -69,6 +73,7 @@ extern struct apdu apdu;
 
 extern uint16_t set_res_sw(uint8_t sw1, uint8_t sw2);
 extern int process_apdu(void);
+// Use the device-wide interface number, which is unique across USB classes.
 extern uint16_t apdu_process(uint8_t itf, const_byte_array_t buffer);
 extern void apdu_finish(void);
 extern uint16_t apdu_next(void);

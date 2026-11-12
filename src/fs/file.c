@@ -20,6 +20,10 @@
 #include "tlv.h"
 #include "apdu.h"
 #include <stdio.h>
+#ifdef ESP_PLATFORM
+#include "esp_log.h"
+#include "esp_timer.h"
+#endif
 
 #define MAX_DEPTH 4
 
@@ -32,20 +36,16 @@ extern const uintptr_t end_data_pool;
 extern const uintptr_t start_data_pool;
 extern const uintptr_t end_rom_pool;
 extern const uintptr_t start_rom_pool;
-#ifndef ENABLE_EMULATION
 file_entry_t sef_phy = {.fid = EF_PHY, .parent = 5, .name = NULL, .type = FILE_TYPE_INTERNAL_EF | FILE_DATA_FLASH | FILE_PERSISTENT, .data = NULL, .ef_structure = FILE_EF_TRANSPARENT, .acl = {0xff}};
 file_t *ef_phy = &sef_phy.file;
-#endif
 
 static const file_entry_t *file_static_entry(const file_t *file) {
     if (!file) {
         return NULL;
     }
-#ifndef ENABLE_EMULATION
     if (file == ef_phy) {
         return &sef_phy;
     }
-#endif
     uintptr_t addr = (uintptr_t)file - offsetof(file_entry_t, file);
     uintptr_t first = (uintptr_t)&file_entries[0];
     uintptr_t last = (uintptr_t)file_last;
@@ -169,11 +169,9 @@ file_t *file_search_by_name(const_byte_array_t name) {
 }
 
 file_t *file_search_by_fid(const uint16_t fid, const file_t *parent, const uint8_t sp) {
-#ifndef ENABLE_EMULATION
     if (fid == EF_PHY) {
         return ef_phy;
     }
-#endif
     for (file_entry_t *p = file_entries; p != file_last; p++) {
         if (p->fid != 0x0000 && p->fid == fid) {
             if (!parent || (parent && is_parent(p, parent))) {
@@ -227,6 +225,10 @@ static file_t *find_dynamic_slot(uint16_t fid) {
         slot = (slot + step) % DYNAMIC_FILE_SLOTS;
     }
     return deleted;
+}
+
+uint16_t file_dynamic_slots_available(void) {
+    return MAX_DYNAMIC_FILES - dynamic_files;
 }
 
 void file_for_each_dynamic(file_iter_cb cb, void *ctx) {
@@ -358,7 +360,11 @@ static void scan_region_internal(bool persistent, bool allow_force_restore) {
             corrupted = true;
             break;
         }
+#ifdef ESP_PLATFORM
+        ESP_LOGD("STORAGE", "[%x] scan fid %x, len %lu", (unsigned int)base, fid, (unsigned long)length);
+#else
         printf("[%x] scan fid %x, len %lu\n", (unsigned int)base, fid, (unsigned long)length);
+#endif
         file_t *file = (file_t *) file_search_by_fid(fid, NULL, SPECIFY_EF);
         if (!file) {
             file = file_new(fid);
@@ -393,6 +399,9 @@ static void scan_region(bool persistent) {
 }
 
 void file_scan_flash(void) {
+#ifdef ESP_PLATFORM
+    int64_t started = esp_timer_get_time();
+#endif
     file_initialize_flash(false); //soft initialization
     uint32_t r1 = (uint32_t)flash_read_uintptr(end_rom_pool);
     uint32_t r2 = (uint32_t)flash_read_uintptr(end_rom_pool + sizeof(uintptr_t));
@@ -404,6 +413,11 @@ void file_scan_flash(void) {
     printf("SCAN\n");
     scan_region(true);
     scan_region(false);
+#ifdef ESP_PLATFORM
+    ESP_LOGI("STORAGE", "Flash scan complete: %lu records, %u dynamic files, %lld ms",
+        (unsigned long)num_files, (unsigned)dynamic_files,
+        (long long)((esp_timer_get_time() - started) / 1000));
+#endif
 }
 
 uint8_t *file_read(const uint8_t *addr) {
